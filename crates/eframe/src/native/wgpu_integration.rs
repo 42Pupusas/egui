@@ -442,6 +442,18 @@ impl WinitApp for WgpuWinitApp<'_> {
         }
     }
 
+    fn run_logic_only(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        window_id: WindowId,
+    ) -> Result<EventResult> {
+        if let Some(running) = &mut self.running {
+            running.run_logic_only(window_id, event_loop)
+        } else {
+            Ok(EventResult::Wait)
+        }
+    }
+
     fn resumed(&mut self, event_loop: &ActiveEventLoop) -> crate::Result<EventResult> {
         log::debug!("Event::Resumed");
 
@@ -595,6 +607,119 @@ impl WgpuWinitRunning<'_> {
         shared.painter.destroy();
     }
 
+    /// Run an egui pass without painting, for a window whose redraw never arrived.
+    ///
+    /// Used when a requested redraw never produced a `RedrawRequested`, so the
+    /// app keeps ticking and can still ask to be shown again.
+    /// See <https://github.com/emilk/egui/issues/5136>.
+    #[expect(clippy::unnecessary_wraps, reason = "mirrors run_ui_and_paint")]
+    fn run_logic_only(
+        &mut self,
+        window_id: WindowId,
+        event_loop: &ActiveEventLoop,
+    ) -> Result<EventResult> {
+        profiling::function_scope!();
+
+        let Self {
+            app,
+            integration,
+            shared,
+            ..
+        } = self;
+
+        let Some(viewport_id) = shared
+            .borrow()
+            .viewport_from_window
+            .get(&window_id)
+            .copied()
+        else {
+            return Ok(EventResult::Wait);
+        };
+
+        let raw_input = {
+            let mut shared_lock = shared.borrow_mut();
+            let SharedState { viewports, .. } = &mut *shared_lock;
+
+            // Only the root viewport carries app logic.
+            let Some(viewport) = viewports.get_mut(&viewport_id) else {
+                return Ok(EventResult::Wait);
+            };
+            if viewport.viewport_ui_cb.is_some() {
+                return Ok(EventResult::Wait);
+            }
+
+            let (Some(window), Some(egui_winit)) =
+                (viewport.window.as_ref(), viewport.egui_winit.as_mut())
+            else {
+                return Ok(EventResult::Wait);
+            };
+
+            let mut raw_input = egui_winit.take_egui_input(window);
+            integration.pre_update();
+            raw_input.time = Some(integration.beginning.elapsed().as_secs_f64());
+            raw_input.viewports = viewports
+                .iter()
+                .map(|(id, viewport)| (*id, viewport.info.clone()))
+                .collect();
+            raw_input
+        };
+
+        Self::tick_logic(
+            app.as_mut(),
+            integration,
+            shared,
+            viewport_id,
+            raw_input,
+            event_loop,
+        );
+
+        Ok(if integration.should_close() {
+            EventResult::CloseRequested
+        } else {
+            EventResult::Wait
+        })
+    }
+
+    /// Run one logic-only egui pass and apply its output.
+    fn tick_logic(
+        app: &mut dyn crate::App,
+        integration: &mut EpiIntegration,
+        shared: &RefCell<SharedState>,
+        viewport_id: ViewportId,
+        raw_input: egui::RawInput,
+        event_loop: &ActiveEventLoop,
+    ) {
+        let egui::LogicOutput {
+            platform_output,
+            viewport_commands,
+        } = integration.update_logic_only(app, raw_input);
+
+        let mut shared_mut = shared.borrow_mut();
+        let SharedState { viewports, .. } = &mut *shared_mut;
+
+        if let Some(viewport) = viewports.get_mut(&viewport_id) {
+            viewport.info.events.clear(); // they should have been processed
+            if let Viewport {
+                window: Some(window),
+                egui_winit: Some(egui_winit),
+                ..
+            } = viewport
+            {
+                egui_winit.handle_platform_output_with_event_loop(
+                    window,
+                    event_loop,
+                    platform_output,
+                );
+            }
+        }
+
+        for (id, commands) in viewport_commands {
+            if let Some(viewport) = viewports.get_mut(&id) {
+                viewport.process_commands(&integration.egui_ctx, commands);
+            }
+        }
+    }
+
     /// This is called both for the root viewport, and all deferred viewports
     fn run_ui_and_paint(
         &mut self,
@@ -703,35 +828,14 @@ impl WgpuWinitRunning<'_> {
             let is_root_viewport = viewport_ui_cb.is_none();
             if is_root_viewport {
                 // The app logic keeps ticking, so it can e.g. ask to be shown again:
-                let egui::LogicOutput {
-                    platform_output,
-                    viewport_commands,
-                } = integration.update_logic_only(app.as_mut(), raw_input);
-
-                let mut shared_mut = shared.borrow_mut();
-                let SharedState { viewports, .. } = &mut *shared_mut;
-
-                if let Some(viewport) = viewports.get_mut(&viewport_id) {
-                    viewport.info.events.clear(); // they should have been processed
-                    if let Viewport {
-                        window: Some(window),
-                        egui_winit: Some(egui_winit),
-                        ..
-                    } = viewport
-                    {
-                        egui_winit.handle_platform_output_with_event_loop(
-                            window,
-                            event_loop,
-                            platform_output,
-                        );
-                    }
-                }
-
-                for (id, commands) in viewport_commands {
-                    if let Some(viewport) = viewports.get_mut(&id) {
-                        viewport.process_commands(&integration.egui_ctx, commands);
-                    }
-                }
+                Self::tick_logic(
+                    app.as_mut(),
+                    integration,
+                    shared,
+                    viewport_id,
+                    raw_input,
+                    event_loop,
+                );
             }
 
             sleep_if_invisible_or_minimized(

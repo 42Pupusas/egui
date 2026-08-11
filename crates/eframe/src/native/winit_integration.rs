@@ -103,6 +103,17 @@ pub trait WinitApp {
         window_id: WindowId,
     ) -> crate::Result<EventResult>;
 
+    /// Run the app's logic without painting.
+    ///
+    /// Called when a requested redraw was never delivered, so the app keeps
+    /// ticking and can still react (e.g. ask to be shown again).
+    /// See <https://github.com/emilk/egui/issues/5136>.
+    fn run_logic_only(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        window_id: WindowId,
+    ) -> crate::Result<EventResult>;
+
     fn suspended(&mut self, event_loop: &ActiveEventLoop) -> crate::Result<EventResult>;
 
     fn resumed(&mut self, event_loop: &ActiveEventLoop) -> crate::Result<EventResult>;

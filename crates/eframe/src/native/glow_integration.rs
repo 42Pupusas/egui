@@ -466,6 +466,18 @@ impl WinitApp for GlowWinitApp<'_> {
         }
     }
 
+    fn run_logic_only(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        window_id: WindowId,
+    ) -> Result<EventResult> {
+        if let Some(running) = &mut self.running {
+            running.run_logic_only(event_loop, window_id)
+        } else {
+            Ok(EventResult::Wait)
+        }
+    }
+
     fn resumed(&mut self, event_loop: &ActiveEventLoop) -> crate::Result<EventResult> {
         log::debug!("Event::Resumed");
 
@@ -563,6 +575,100 @@ impl WinitApp for GlowWinitApp<'_> {
 }
 
 impl GlowWinitRunning<'_> {
+    /// Run an egui pass without painting, for a window whose redraw never arrived.
+    ///
+    /// Used when a requested redraw never produced a `RedrawRequested`, so the
+    /// app keeps ticking and can still ask to be shown again.
+    /// See <https://github.com/emilk/egui/issues/5136>.
+    #[expect(clippy::unnecessary_wraps, reason = "mirrors run_ui_and_paint")]
+    fn run_logic_only(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        window_id: WindowId,
+    ) -> Result<EventResult> {
+        profiling::function_scope!();
+
+        let Some(viewport_id) = self
+            .glutin
+            .borrow()
+            .viewport_from_window
+            .get(&window_id)
+            .copied()
+        else {
+            return Ok(EventResult::Wait);
+        };
+
+        let raw_input = {
+            let mut glutin = self.glutin.borrow_mut();
+            let Some(viewport) = glutin.viewports.get_mut(&viewport_id) else {
+                return Ok(EventResult::Wait);
+            };
+
+            // Only the root viewport carries app logic.
+            if viewport.viewport_ui_cb.is_some() {
+                return Ok(EventResult::Wait);
+            }
+
+            let (Some(window), Some(egui_winit)) =
+                (viewport.window.clone(), viewport.egui_winit.as_mut())
+            else {
+                return Ok(EventResult::Wait);
+            };
+
+            let mut raw_input = egui_winit.take_egui_input(&window);
+            self.integration.pre_update();
+            raw_input.time = Some(self.integration.beginning.elapsed().as_secs_f64());
+            raw_input.viewports = glutin
+                .viewports
+                .iter()
+                .map(|(id, viewport)| (*id, viewport.info.clone()))
+                .collect();
+            raw_input
+        };
+
+        self.tick_logic(viewport_id, raw_input, event_loop);
+
+        Ok(if self.integration.should_close() {
+            EventResult::CloseRequested
+        } else {
+            EventResult::Wait
+        })
+    }
+
+    /// Run one logic-only egui pass and apply its output.
+    fn tick_logic(
+        &mut self,
+        viewport_id: ViewportId,
+        raw_input: egui::RawInput,
+        event_loop: &ActiveEventLoop,
+    ) {
+        let egui::LogicOutput {
+            platform_output,
+            viewport_commands,
+        } = self
+            .integration
+            .update_logic_only(self.app.as_mut(), raw_input);
+
+        let mut glutin = self.glutin.borrow_mut();
+        if let Some(viewport) = glutin.viewports.get_mut(&viewport_id) {
+            viewport.info.events.clear(); // they should have been processed
+            if let Some(window) = viewport.window.clone()
+                && let Some(egui_winit) = viewport.egui_winit.as_mut()
+            {
+                egui_winit.handle_platform_output_with_event_loop(
+                    &window,
+                    event_loop,
+                    platform_output,
+                );
+            }
+        }
+        for (id, commands) in viewport_commands {
+            if let Some(viewport) = glutin.viewports.get_mut(&id) {
+                viewport.process_commands(&self.integration.egui_ctx, commands);
+            }
+        }
+    }
+
     fn run_ui_and_paint(
         &mut self,
         event_loop: &ActiveEventLoop,
@@ -642,31 +748,7 @@ impl GlowWinitRunning<'_> {
             let is_root_viewport = viewport_ui_cb.is_none();
             if is_root_viewport {
                 // The app logic keeps ticking, so it can e.g. ask to be shown again:
-                let egui::LogicOutput {
-                    platform_output,
-                    viewport_commands,
-                } = self
-                    .integration
-                    .update_logic_only(self.app.as_mut(), raw_input);
-
-                let mut glutin = self.glutin.borrow_mut();
-                if let Some(viewport) = glutin.viewports.get_mut(&viewport_id) {
-                    viewport.info.events.clear(); // they should have been processed
-                    if let Some(window) = viewport.window.clone()
-                        && let Some(egui_winit) = viewport.egui_winit.as_mut()
-                    {
-                        egui_winit.handle_platform_output_with_event_loop(
-                            &window,
-                            event_loop,
-                            platform_output,
-                        );
-                    }
-                }
-                for (id, commands) in viewport_commands {
-                    if let Some(viewport) = glutin.viewports.get_mut(&id) {
-                        viewport.process_commands(&self.integration.egui_ctx, commands);
-                    }
-                }
+                self.tick_logic(viewport_id, raw_input, event_loop);
             }
 
             sleep_if_invisible_or_minimized(
